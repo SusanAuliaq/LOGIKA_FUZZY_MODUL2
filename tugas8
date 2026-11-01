@@ -1,0 +1,158 @@
+"""
+Praktikum 8 - Logika Fuzzy (Modul 2)
+SISTEM PENENTUAN HARGA JUAL PRODUK UMKM MENGGUNAKAN LOGIKA FUZZY
+Nama : ................   NIM : ................
+Jalankan: python Praktikum8_NIM.py   (butuh: numpy, matplotlib)
+"""
+# ==========================================================
+# INTI SISTEM FUZZY: HARGA JUAL PRODUK UMKM
+# Input  : Biaya Produksi (Rp 0-200.000), Permintaan (0-100 %)
+# Output : Harga Jual (Rp 0-200.000)
+# ==========================================================
+import numpy as np
+
+# ---------- Fungsi keanggotaan ----------
+def trimf(x, p):
+    a, b, c = p
+    x = np.asarray(x, dtype=float)
+    y = np.zeros_like(x)
+    if b > a:
+        m = (x > a) & (x < b); y[m] = (x[m] - a) / (b - a)
+    if c > b:
+        m = (x > b) & (x < c); y[m] = (c - x[m]) / (c - b)
+    y[x == b] = 1.0
+    return np.clip(y, 0.0, 1.0)
+
+def trapmf(x, p):
+    a, b, c, d = p
+    x = np.asarray(x, dtype=float)
+    y = np.zeros_like(x)
+    if b > a:
+        m = (x > a) & (x < b); y[m] = (x[m] - a) / (b - a)
+    if d > c:
+        m = (x > c) & (x < d); y[m] = (d - x[m]) / (d - c)
+    y[(x >= b) & (x <= c)] = 1.0
+    return np.clip(y, 0.0, 1.0)
+
+# ---------- Semesta & himpunan fuzzy ----------
+U_BIAYA  = np.linspace(0, 200000, 2001)
+U_PERMIN = np.linspace(0, 100, 1001)
+U_HARGA  = np.linspace(0, 200000, 2001)
+
+MF_BIAYA = {
+    "Rendah": ("trap", [0, 0, 40000, 80000]),
+    "Sedang": ("tri",  [60000, 100000, 140000]),
+    "Tinggi": ("trap", [120000, 160000, 200000, 200000]),
+}
+MF_PERMIN = {
+    "Rendah": ("trap", [0, 0, 20, 45]),
+    "Sedang": ("tri",  [30, 50, 70]),
+    "Tinggi": ("trap", [55, 80, 100, 100]),
+}
+MF_HARGA = {
+    "Murah":  ("trap", [20000, 40000, 80000, 110000]),
+    "Sedang": ("tri",  [80000, 120000, 160000]),
+    "Mahal":  ("trap", [140000, 180000, 200000, 200000]),
+}
+
+def mf_eval(spec, x):
+    tipe, p = spec
+    return trimf(x, p) if tipe == "tri" else trapmf(x, p)
+
+def fuzzifikasi(nilai, mf_dict):
+    return {lbl: float(mf_eval(spec, np.array([nilai]))[0]) for lbl, spec in mf_dict.items()}
+
+# ---------- Matriks basis aturan (Biaya x Permintaan -> Harga) ----------
+MATRIKS = {
+    ("Rendah", "Rendah"): "Murah",  ("Rendah", "Sedang"): "Murah",  ("Rendah", "Tinggi"): "Sedang",
+    ("Sedang", "Rendah"): "Sedang", ("Sedang", "Sedang"): "Sedang", ("Sedang", "Tinggi"): "Mahal",
+    ("Tinggi", "Rendah"): "Mahal",  ("Tinggi", "Sedang"): "Mahal",  ("Tinggi", "Tinggi"): "Mahal",
+}
+RULES = [(f"R{i+1}", b, p, h) for i, ((b, p), h) in enumerate(MATRIKS.items())]
+
+def hitung_alpha(biaya, permintaan):
+    """Firing strength semua aturan (operator AND = min)."""
+    fb = fuzzifikasi(biaya, MF_BIAYA)
+    fp = fuzzifikasi(permintaan, MF_PERMIN)
+    return [(rid, b, p, h, min(fb[b], fp[p])) for rid, b, p, h in RULES], fb, fp
+
+# ---------- Mamdani ----------
+def mamdani_agregasi(alphas):
+    agg = np.zeros_like(U_HARGA)
+    for _, _, _, h, a in alphas:
+        agg = np.fmax(agg, np.fmin(a, mf_eval(MF_HARGA[h], U_HARGA)))
+    return agg
+
+def defuzz(x, mu, metode="centroid"):
+    if mu.sum() == 0:
+        return 0.0
+    if metode == "centroid":
+        return float(np.sum(x * mu) / np.sum(mu))
+    if metode == "bisector":
+        luas = np.concatenate([[0], np.cumsum((mu[1:] + mu[:-1]) / 2 * np.diff(x))])
+        return float(np.interp(luas[-1] / 2, luas, x))
+    mx = mu.max()
+    M = x[np.isclose(mu, mx, atol=1e-9)]
+    return float({"mom": M.mean(), "som": M.min(), "lom": M.max()}[metode])
+
+def mamdani(biaya, permintaan, metode="centroid"):
+    al, _, _ = hitung_alpha(biaya, permintaan)
+    return defuzz(U_HARGA, mamdani_agregasi(al), metode)
+
+def rupiah(v):
+    return "Rp" + f"{v:,.0f}".replace(",", ".")
+
+# ==========================================================
+# PRAKTIKUM 8 - METODE MAMDANI & 5 METODE DEFUZZIFIKASI
+# ==========================================================
+import matplotlib
+matplotlib.use("Agg")
+import matplotlib.pyplot as plt
+
+METODE = ["centroid", "bisector", "mom", "som", "lom"]
+WARNA = {"centroid": "red", "bisector": "purple", "mom": "black", "som": "green", "lom": "orange"}
+
+def bandingkan(agg, judul, file_png):
+    hasil = {m: defuzz(U_HARGA, agg, m) for m in METODE}
+    plt.figure(figsize=(12, 6.5))
+    plt.plot(U_HARGA, agg, "b", lw=2.5, label="Kurva agregasi")
+    plt.fill_between(U_HARGA, 0, agg, color="skyblue", alpha=0.4)
+    for m, v in hasil.items():
+        plt.axvline(v, color=WARNA[m], ls="--", lw=2, label=f"{m.upper()} ({rupiah(v)})")
+    plt.title(judul, fontweight="bold"); plt.xlabel("Harga Jual (Rp)"); plt.ylabel("Derajat keanggotaan")
+    plt.ylim(-0.05, 1.05); plt.grid(True, ls=":", alpha=0.6); plt.legend(loc="upper left", fontsize=9)
+    plt.tight_layout(); plt.savefig(file_png, dpi=200); plt.close()
+    return hasil
+
+def cetak(hasil, judul):
+    print("=" * 62); print(judul); print("=" * 62)
+    for m, v in hasil.items():
+        print(f" - Metode {m.upper():<9}: {rupiah(v):>10}")
+    print()
+
+if __name__ == "__main__":
+    # --- Bagian 1: simulasi firing strength (seperti Tugas Praktikum 8) ---
+    alpha = {"Murah": 0.5, "Sedang": 0.8, "Mahal": 0.2}
+    agg = np.zeros_like(U_HARGA)
+    for lbl, a in alpha.items():
+        agg = np.fmax(agg, np.fmin(a, mf_eval(MF_HARGA[lbl], U_HARGA)))
+    h1 = bandingkan(agg, "Defuzzifikasi Mamdani (a Murah=0.5, Sedang=0.8, Mahal=0.2)", "komparasi_defuzzifikasi_simulasi.png")
+    cetak(h1, "SIMULASI: alpha Murah=0.5, Sedang=0.8, Mahal=0.2")
+
+    # --- Bagian 2: kasus nyata dari input crisp (Biaya Rp75.000, Permintaan 60%) ---
+    b, p = 75000, 60
+    al, fb, fp = hitung_alpha(b, p)
+    print(f"Kasus nyata: Biaya = {rupiah(b)}, Permintaan = {p}%")
+    print("  Aturan aktif: " + ", ".join(f"{r[0]}({r[1]}/{r[2]}->{r[3]}, a={r[4]:.2f})" for r in al if r[4] > 0))
+    agg2 = mamdani_agregasi(al)
+    h2 = bandingkan(agg2, f"Defuzzifikasi Mamdani - Biaya {rupiah(b)}, Permintaan {p}%", "komparasi_defuzzifikasi_kasus_nyata.png")
+    cetak(h2, "KASUS NYATA (Biaya Rp75.000, Permintaan 60%)")
+
+    # --- Bagian 3: tabel perbandingan beberapa kasus ---
+    print("TABEL PERBANDINGAN 5 METODE PADA BEBERAPA KASUS")
+    print(f"{'Biaya':>10} {'Permintaan':>11} | " + " | ".join(f"{m.upper():>9}" for m in METODE) + " | Rugi?")
+    for b, p in [(30000, 10), (75000, 60), (100000, 50), (130000, 80), (180000, 95)]:
+        agg3 = mamdani_agregasi(hitung_alpha(b, p)[0])
+        v = {m: defuzz(U_HARGA, agg3, m) for m in METODE}
+        rugi = ",".join(m for m in METODE if v[m] < b) or "-"
+        print(f"{b:>10} {p:>10}% | " + " | ".join(f"{v[m]:>9.0f}" for m in METODE) + f" | {rugi}")
