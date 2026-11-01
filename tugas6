@@ -1,0 +1,163 @@
+import numpy as np
+
+def trimf(x, p):
+    a, b, c = p
+    x = np.asarray(x, dtype=float)
+    y = np.zeros_like(x)
+    if b > a:
+        m = (x > a) & (x < b); y[m] = (x[m] - a) / (b - a)
+    if c > b:
+        m = (x > b) & (x < c); y[m] = (c - x[m]) / (c - b)
+    y[x == b] = 1.0
+    return np.clip(y, 0.0, 1.0)
+
+def trapmf(x, p):
+    a, b, c, d = p
+    x = np.asarray(x, dtype=float)
+    y = np.zeros_like(x)
+    if b > a:
+        m = (x > a) & (x < b); y[m] = (x[m] - a) / (b - a)
+    if d > c:
+        m = (x > c) & (x < d); y[m] = (d - x[m]) / (d - c)
+    y[(x >= b) & (x <= c)] = 1.0
+    return np.clip(y, 0.0, 1.0)
+
+U_BIAYA  = np.linspace(0, 200000, 2001)
+U_PERMIN = np.linspace(0, 100, 1001)
+U_HARGA  = np.linspace(0, 200000, 2001)
+
+MF_BIAYA = {
+    "Rendah": ("trap", [0, 0, 40000, 80000]),
+    "Sedang": ("tri",  [60000, 100000, 140000]),
+    "Tinggi": ("trap", [120000, 160000, 200000, 200000]),
+}
+MF_PERMIN = {
+    "Rendah": ("trap", [0, 0, 20, 45]),
+    "Sedang": ("tri",  [30, 50, 70]),
+    "Tinggi": ("trap", [55, 80, 100, 100]),
+}
+MF_HARGA = {
+    "Murah":  ("trap", [20000, 40000, 80000, 110000]),
+    "Sedang": ("tri",  [80000, 120000, 160000]),
+    "Mahal":  ("trap", [140000, 180000, 200000, 200000]),
+}
+
+def mf_eval(spec, x):
+    tipe, p = spec
+    return trimf(x, p) if tipe == "tri" else trapmf(x, p)
+
+def fuzzifikasi(nilai, mf_dict):
+    return {lbl: float(mf_eval(spec, np.array([nilai]))[0]) for lbl, spec in mf_dict.items()}
+
+MATRIKS = {
+    ("Rendah", "Rendah"): "Murah",  ("Rendah", "Sedang"): "Murah",  ("Rendah", "Tinggi"): "Sedang",
+    ("Sedang", "Rendah"): "Sedang", ("Sedang", "Sedang"): "Sedang", ("Sedang", "Tinggi"): "Mahal",
+    ("Tinggi", "Rendah"): "Mahal",  ("Tinggi", "Sedang"): "Mahal",  ("Tinggi", "Tinggi"): "Mahal",
+}
+RULES = [(f"R{i+1}", b, p, h) for i, ((b, p), h) in enumerate(MATRIKS.items())]
+
+def hitung_alpha(biaya, permintaan):
+    """Firing strength semua aturan (operator AND = min)."""
+    fb = fuzzifikasi(biaya, MF_BIAYA)
+    fp = fuzzifikasi(permintaan, MF_PERMIN)
+    return [(rid, b, p, h, min(fb[b], fp[p])) for rid, b, p, h in RULES], fb, fp
+
+def mamdani_agregasi(alphas):
+    agg = np.zeros_like(U_HARGA)
+    for _, _, _, h, a in alphas:
+        agg = np.fmax(agg, np.fmin(a, mf_eval(MF_HARGA[h], U_HARGA)))
+    return agg
+
+def defuzz(x, mu, metode="centroid"):
+    if mu.sum() == 0:
+        return 0.0
+    if metode == "centroid":
+        return float(np.sum(x * mu) / np.sum(mu))
+    if metode == "bisector":
+        luas = np.concatenate([[0], np.cumsum((mu[1:] + mu[:-1]) / 2 * np.diff(x))])
+        return float(np.interp(luas[-1] / 2, luas, x))
+    mx = mu.max()
+    M = x[np.isclose(mu, mx, atol=1e-9)]
+    return float({"mom": M.mean(), "som": M.min(), "lom": M.max()}[metode])
+
+def mamdani(biaya, permintaan, metode="centroid"):
+    al, _, _ = hitung_alpha(biaya, permintaan)
+    return defuzz(U_HARGA, mamdani_agregasi(al), metode)
+
+def rupiah(v):
+    return "Rp" + f"{v:,.0f}".replace(",", ".")
+
+class FuzzyRule:
+    def __init__(self, rule_id, antecedent, consequent, operator="AND"):
+        self.rule_id = rule_id
+        self.antecedent = antecedent      # {'biaya': 'Rendah', 'permintaan': 'Sedang'}
+        self.consequent = consequent      # {'harga': 'Murah'}
+        self.operator = operator.upper()
+
+    def hitung_firing_strength(self, derajat):
+        nilai = [derajat[v].get(l, 0.0) for v, l in self.antecedent.items()]
+        if not nilai:
+            return 0.0
+        if self.operator == "AND":
+            return min(nilai)
+        if self.operator == "OR":
+            return max(nilai)
+        raise ValueError(f"Operator {self.operator} tidak dikenali.")
+
+    def __str__(self):
+        s = f" {self.operator} ".join(f"{v} is {l}" for v, l in self.antecedent.items())
+        h = ", ".join(f"{v} is {l}" for v, l in self.consequent.items())
+        return f"[{self.rule_id}] IF {s} THEN {h}"
+
+# ---- Basis aturan 3 x 3 = 9 aturan ----
+rule_base = [FuzzyRule(rid, {"biaya": b, "permintaan": p}, {"harga": h}) for rid, b, p, h in RULES]
+
+def evaluasi(derajat, judul):
+    print("=" * 78)
+    print(judul)
+    print("=" * 78)
+    aktif = []
+    for r in rule_base:
+        a = r.hitung_firing_strength(derajat)
+        print(f"{r} --> " + (f"AKTIF (alpha = {a:.2f})" if a > 0 else "NONAKTIF"))
+        if a > 0:
+            aktif.append((r.rule_id, r.consequent["harga"], a))
+    print("-" * 78)
+    print("ATURAN TERPICU:")
+    for rid, h, a in aktif:
+        print(f"  - {rid:<4}: Harga = {h:<7} alpha = {a:.2f}")
+    print()
+    return aktif
+
+if __name__ == "__main__":
+    print("MATRIKS BASIS ATURAN (baris: Biaya, kolom: Permintaan)")
+    print(f"{'Biaya \\ Permintaan':<20}{'Rendah':<10}{'Sedang':<10}{'Tinggi':<10}")
+    for b in ["Rendah", "Sedang", "Tinggi"]:
+        print(f"{b:<20}" + "".join(f"{MATRIKS[(b, p)]:<10}" for p in ["Rendah", "Sedang", "Tinggi"]))
+    print()
+
+    skenario = {
+        "A (Biaya murah, permintaan sepi)":        (20000, 10),
+        "B (Biaya sedang, permintaan menengah-tinggi)": (90000, 60),
+        "C (Biaya mahal, permintaan ramai)":       (180000, 95),
+    }
+    for nama, (b, p) in skenario.items():
+        d = {"biaya": fuzzifikasi(b, MF_BIAYA), "permintaan": fuzzifikasi(p, MF_PERMIN)}
+        print(f"Input: Biaya = {rupiah(b)}, Permintaan = {p}%")
+        print(f"  Fuzzifikasi Biaya      : {d['biaya']}")
+        print(f"  Fuzzifikasi Permintaan : {d['permintaan']}")
+        evaluasi(d, f"SKENARIO {nama}")
+
+    d_tugas = {
+        "biaya":      {"Rendah": 0.2, "Sedang": 0.8, "Tinggi": 0.0},
+        "permintaan": {"Rendah": 0.0, "Sedang": 0.5, "Tinggi": 0.5},
+    }
+    aktif = evaluasi(d_tugas, "TUGAS PRAKTIKUM 6 (Biaya: 0.2/0.8/0.0, Permintaan: 0.0/0.5/0.5)")
+
+    kosong = 0
+    for b in np.linspace(0, 200000, 201):
+        for p in np.linspace(0, 100, 101):
+            al, _, _ = hitung_alpha(b, p)
+            if sum(a[4] for a in al) == 0:
+                kosong += 1
+    print(f"Uji kelengkapan: kombinasi input tanpa aturan aktif = {kosong} dari {201*101}")
