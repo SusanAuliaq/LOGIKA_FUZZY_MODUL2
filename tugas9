@@ -1,0 +1,160 @@
+import numpy as np
+
+# ---------- Fungsi keanggotaan ----------
+def trimf(x, p):
+    a, b, c = p
+    x = np.asarray(x, dtype=float)
+    y = np.zeros_like(x)
+    if b > a:
+        m = (x > a) & (x < b); y[m] = (x[m] - a) / (b - a)
+    if c > b:
+        m = (x > b) & (x < c); y[m] = (c - x[m]) / (c - b)
+    y[x == b] = 1.0
+    return np.clip(y, 0.0, 1.0)
+
+def trapmf(x, p):
+    a, b, c, d = p
+    x = np.asarray(x, dtype=float)
+    y = np.zeros_like(x)
+    if b > a:
+        m = (x > a) & (x < b); y[m] = (x[m] - a) / (b - a)
+    if d > c:
+        m = (x > c) & (x < d); y[m] = (d - x[m]) / (d - c)
+    y[(x >= b) & (x <= c)] = 1.0
+    return np.clip(y, 0.0, 1.0)
+
+# ---------- Semesta & himpunan fuzzy ----------
+U_BIAYA  = np.linspace(0, 200000, 2001)
+U_PERMIN = np.linspace(0, 100, 1001)
+U_HARGA  = np.linspace(0, 200000, 2001)
+
+MF_BIAYA = {
+    "Rendah": ("trap", [0, 0, 40000, 80000]),
+    "Sedang": ("tri",  [60000, 100000, 140000]),
+    "Tinggi": ("trap", [120000, 160000, 200000, 200000]),
+}
+MF_PERMIN = {
+    "Rendah": ("trap", [0, 0, 20, 45]),
+    "Sedang": ("tri",  [30, 50, 70]),
+    "Tinggi": ("trap", [55, 80, 100, 100]),
+}
+MF_HARGA = {
+    "Murah":  ("trap", [20000, 40000, 80000, 110000]),
+    "Sedang": ("tri",  [80000, 120000, 160000]),
+    "Mahal":  ("trap", [140000, 180000, 200000, 200000]),
+}
+
+def mf_eval(spec, x):
+    tipe, p = spec
+    return trimf(x, p) if tipe == "tri" else trapmf(x, p)
+
+def fuzzifikasi(nilai, mf_dict):
+    return {lbl: float(mf_eval(spec, np.array([nilai]))[0]) for lbl, spec in mf_dict.items()}
+
+# ---------- Matriks basis aturan (Biaya x Permintaan -> Harga) ----------
+MATRIKS = {
+    ("Rendah", "Rendah"): "Murah",  ("Rendah", "Sedang"): "Murah",  ("Rendah", "Tinggi"): "Sedang",
+    ("Sedang", "Rendah"): "Sedang", ("Sedang", "Sedang"): "Sedang", ("Sedang", "Tinggi"): "Mahal",
+    ("Tinggi", "Rendah"): "Mahal",  ("Tinggi", "Sedang"): "Mahal",  ("Tinggi", "Tinggi"): "Mahal",
+}
+RULES = [(f"R{i+1}", b, p, h) for i, ((b, p), h) in enumerate(MATRIKS.items())]
+
+def hitung_alpha(biaya, permintaan):
+    """Firing strength semua aturan (operator AND = min)."""
+    fb = fuzzifikasi(biaya, MF_BIAYA)
+    fp = fuzzifikasi(permintaan, MF_PERMIN)
+    return [(rid, b, p, h, min(fb[b], fp[p])) for rid, b, p, h in RULES], fb, fp
+
+# ---------- Mamdani ----------
+def mamdani_agregasi(alphas):
+    agg = np.zeros_like(U_HARGA)
+    for _, _, _, h, a in alphas:
+        agg = np.fmax(agg, np.fmin(a, mf_eval(MF_HARGA[h], U_HARGA)))
+    return agg
+
+def defuzz(x, mu, metode="centroid"):
+    if mu.sum() == 0:
+        return 0.0
+    if metode == "centroid":
+        return float(np.sum(x * mu) / np.sum(mu))
+    if metode == "bisector":
+        luas = np.concatenate([[0], np.cumsum((mu[1:] + mu[:-1]) / 2 * np.diff(x))])
+        return float(np.interp(luas[-1] / 2, luas, x))
+    mx = mu.max()
+    M = x[np.isclose(mu, mx, atol=1e-9)]
+    return float({"mom": M.mean(), "som": M.min(), "lom": M.max()}[metode])
+
+def mamdani(biaya, permintaan, metode="centroid"):
+    al, _, _ = hitung_alpha(biaya, permintaan)
+    return defuzz(U_HARGA, mamdani_agregasi(al), metode)
+
+def rupiah(v):
+    return "Rp" + f"{v:,.0f}".replace(",", ".")
+
+# ==========================================================
+# PRAKTIKUM 9 - METODE SUGENO (ORDE 0 & 1) DAN TSUKAMOTO
+# ==========================================================
+# --- Sugeno orde 0: konsekuen konstanta (Rp) ---
+KONSTANTA = {"Murah": 60000, "Sedang": 120000, "Mahal": 180000}
+# --- Sugeno orde 1: z = p*Biaya + q*Permintaan + r ---
+LINEAR = {"Murah": (1.15, 0, 5000), "Sedang": (1.10, 100, 5000), "Mahal": (1.05, 200, 10000)}
+# --- Tsukamoto: konsekuen monoton [a, b] ---
+TSUKA = {"Murah": ("turun", 40000, 100000), "Sedang": ("naik", 70000, 130000), "Mahal": ("naik", 140000, 200000)}
+
+def hitung_sugeno(alphas, z_values):
+    alphas, z_values = np.array(alphas, float), np.array(z_values, float)
+    return 0.0 if alphas.sum() == 0 else float(np.sum(alphas * z_values) / alphas.sum())
+
+def invers_naik(alpha, a, b):  return a + alpha * (b - a)
+def invers_turun(alpha, a, b): return b - alpha * (b - a)
+
+def sugeno0(biaya, permintaan):
+    al, _, _ = hitung_alpha(biaya, permintaan)
+    return hitung_sugeno([r[4] for r in al], [KONSTANTA[r[3]] for r in al])
+
+def sugeno1(biaya, permintaan):
+    al, _, _ = hitung_alpha(biaya, permintaan)
+    z = [min(200000, max(0, LINEAR[r[3]][0] * biaya + LINEAR[r[3]][1] * permintaan + LINEAR[r[3]][2])) for r in al]
+    return hitung_sugeno([r[4] for r in al], z)
+
+def tsukamoto(biaya, permintaan):
+    al, _, _ = hitung_alpha(biaya, permintaan)
+    z = []
+    for r in al:
+        arah, a, b = TSUKA[r[3]]
+        z.append(invers_naik(r[4], a, b) if arah == "naik" else invers_turun(r[4], a, b))
+    return hitung_sugeno([r[4] for r in al], z), z
+
+if __name__ == "__main__":
+    # --- Contoh perhitungan rinci satu kasus (Biaya Rp75.000, Permintaan 60%) ---
+    b, p = 75000, 60
+    al, fb, fp = hitung_alpha(b, p)
+    print(f"CONTOH RINCI: Biaya = {rupiah(b)}, Permintaan = {p}%")
+    print(f"  mu Biaya      = { {k: round(v, 3) for k, v in fb.items()} }")
+    print(f"  mu Permintaan = { {k: round(v, 3) for k, v in fp.items()} }")
+    t_val, t_z = tsukamoto(b, p)
+    print(f"  {'Aturan':<6}{'Konsekuen':<10}{'alpha':>7}{'z Sugeno-0':>13}{'z Tsukamoto':>13}")
+    for r, zt in zip(al, t_z):
+        if r[4] > 0:
+            print(f"  {r[0]:<6}{r[3]:<10}{r[4]:>7.3f}{KONSTANTA[r[3]]:>13}{zt:>13.0f}")
+    print(f"  Sugeno orde 0 = {rupiah(sugeno0(b, p))} | Sugeno orde 1 = {rupiah(sugeno1(b, p))} | Tsukamoto = {rupiah(t_val)} | Mamdani = {rupiah(mamdani(b, p))}\n")
+
+    # --- 5 variasi input (Tugas Praktikum 9) ---
+    data = [(25000, 15), (60000, 40), (100000, 50), (140000, 75), (180000, 95)]
+    print("=" * 96)
+    print("PERBANDINGAN HARGA JUAL (Rp) ANTAR METODE")
+    print("=" * 96)
+    print(f"{'Biaya':>9}{'Permintaan':>11} |{'Sugeno-0':>10}{'Sugeno-1':>10}{'Tsukamoto':>11}{'Mamdani':>10} |{'|S0-Ts|':>9}{'|S1-Ts|':>9}{'|S0-M|':>9}")
+    for b, p in data:
+        s0, s1, ts, m = sugeno0(b, p), sugeno1(b, p), tsukamoto(b, p)[0], mamdani(b, p)
+        print(f"{b:>9}{p:>10}% |{s0:>10.0f}{s1:>10.0f}{ts:>11.0f}{m:>10.0f} |{abs(s0-ts):>9.0f}{abs(s1-ts):>9.0f}{abs(s0-m):>9.0f}")
+
+    # --- Efisiensi komputasi ---
+    import time
+    N = 300
+    waktu = {}
+    for nama, f in [("Sugeno-0", sugeno0), ("Sugeno-1", sugeno1), ("Tsukamoto", lambda b, p: tsukamoto(b, p)[0]), ("Mamdani", mamdani)]:
+        t0 = time.perf_counter()
+        for _ in range(N): f(100000, 50)
+        waktu[nama] = (time.perf_counter() - t0) / N * 1000
+    print("\nRata-rata waktu komputasi per keputusan (ms): " + ", ".join(f"{k}={v:.3f}" for k, v in waktu.items()))
